@@ -38,7 +38,7 @@ from vllm.v1.core.encoder_cache_manager import (
 )
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
-from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
+from vllm.v1.core.sched.interface import SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
     GrammarOutput,
@@ -201,6 +201,14 @@ class Scheduler(SchedulerInterface):
             if self.is_encoder_decoder
             else EncoderCacheManager(cache_size=encoder_cache_size)
         )
+        # For encoder-decoder models, allocate the maximum number of tokens for Cross
+        # Attn blocks, as for Whisper its input is always padded to the maximum length.
+        # TODO (NickLucche): Generalize to models with variable-length encoder inputs.
+        self._num_encoder_max_input_tokens = (
+            mm_budget.mm_max_toks_per_item[mm_budget.get_modality_with_max_tokens()]
+            if mm_budget and mm_budget.mm_max_toks_per_item
+            else 0
+        )
 
         speculative_config = vllm_config.speculative_config
         self.use_eagle = False
@@ -263,8 +271,6 @@ class Scheduler(SchedulerInterface):
                 vllm_config=self.vllm_config,
             )
 
-        self._pause_state: PauseState = PauseState.UNPAUSED
-
     def _mamba_block_aligned_split(
         self,
         request: Request,
@@ -275,30 +281,27 @@ class Scheduler(SchedulerInterface):
         assert num_external_computed_tokens == 0, (
             "External KV connector is not verified yet"
         )
-        num_computed_tokens = (
-            request.num_computed_tokens
-            + num_new_local_computed_tokens
-            + num_external_computed_tokens
-        )
-        # Perform block-aligned splitting at prefill phase, including:
-        # * non-resumed requests: num_computed_tokens < num_prompt_tokens + 0
-        # * resumed requests: num_computed_tokens < (
-        #                       num_prompt_tokens + num_output_tokens
-        #                     )
-        # NOTE: Use `request.num_tokens - 1` to bypass normal decoding.
-        if num_computed_tokens < max(request.num_prompt_tokens, request.num_tokens - 1):
+        # TODO: need check for resume requests
+        if request.num_output_tokens == 0:  # prefill
             # To enable block-aligned caching of the Mamba state, `num_new_tokens`
             # must be a multiple of `block_size`.
             # As an exception, if `num_new_tokens` is less than `block_size`, the
             # state is simply not cached, requiring no special handling.
             # Additionally, when Eagle mode is enabled, FullAttn prunes the last
             # matching block. To prevent this from causing a Mamba cache miss, the
-            # last chunk must be not smaller than `block_size`.
+            # last chunk must be larger than `block_size`.
             block_size = self.cache_config.block_size
-            last_cache_position = request.num_tokens - request.num_tokens % block_size
+            last_cache_position = (
+                request.num_prompt_tokens - request.num_prompt_tokens % block_size
+            )
             # eagle prune
             if self.use_eagle:
                 last_cache_position = max(last_cache_position - block_size, 0)
+            num_computed_tokens = (
+                request.num_computed_tokens
+                + num_new_local_computed_tokens
+                + num_external_computed_tokens
+            )
             num_computed_tokens_after_sched = num_computed_tokens + num_new_tokens
             if num_computed_tokens_after_sched < last_cache_position:
                 # align to block_size
@@ -335,10 +338,6 @@ class Scheduler(SchedulerInterface):
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
         token_budget = self.max_num_scheduled_tokens
-        if self._pause_state == PauseState.PAUSED_ALL:
-            # Do not schedule any requests when paused.
-            token_budget = 0
-
         # Encoder-related.
         scheduled_encoder_inputs: dict[str, list[int]] = {}
         encoder_compute_budget = self.max_num_encoder_input_tokens
@@ -528,12 +527,12 @@ class Scheduler(SchedulerInterface):
             )
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
-        # Next, schedule the WAITING requests.
-        if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
-            # Use a temporary RequestQueue to collect requests that need to be
-            # skipped and put back at the head of the waiting queue later
-            skipped_waiting_requests = create_request_queue(self.policy)
+        # Use a temporary RequestQueue to collect requests that need to be
+        # skipped and put back at the head of the waiting queue later
+        skipped_waiting_requests = create_request_queue(self.policy)
 
+        # Next, schedule the WAITING requests.
+        if not preempted_reqs:
             while self.waiting and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
                     break
@@ -707,17 +706,11 @@ class Scheduler(SchedulerInterface):
                     0 if request.num_computed_tokens == 0 else self.num_lookahead_tokens
                 )
 
-                # Determine if we need to allocate cross-attention blocks.
-                num_encoder_tokens = 0
-                if (
-                    self.is_encoder_decoder
-                    and request.has_encoder_inputs
-                    and encoder_inputs_to_schedule
-                ):
-                    num_encoder_tokens = sum(
-                        request.get_num_encoder_embeds(i)
-                        for i in encoder_inputs_to_schedule
-                    )
+                num_encoder_tokens = (
+                    self._num_encoder_max_input_tokens
+                    if self.is_encoder_decoder and request.has_encoder_inputs
+                    else 0
+                )
 
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
@@ -806,10 +799,9 @@ class Scheduler(SchedulerInterface):
                         self.encoder_cache_manager.allocate(request, i)
                         if self.ec_connector is not None:
                             self.ec_connector.update_state_after_alloc(request, i)
-
-            # Put back any skipped requests at the head of the waiting queue
-            if skipped_waiting_requests:
-                self.waiting.prepend_requests(skipped_waiting_requests)
+        # Put back any skipped requests at the head of the waiting queue
+        if skipped_waiting_requests:
+            self.waiting.prepend_requests(skipped_waiting_requests)
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
@@ -1399,6 +1391,18 @@ class Scheduler(SchedulerInterface):
 
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
+            request_activations: dict[int, torch.Tensor] | None = None
+            if model_runner_output.activations:
+                req_activations = model_runner_output.activations.get(req_id)
+                if req_activations:
+                    request_activations = {
+                        layer_idx: act.cpu().contiguous()
+                        if act.device.type != "cpu"
+                        else act
+                        for layer_idx, act in req_activations.items()
+                    }
+                    request.activations = request_activations
+
             if (
                 new_token_ids
                 or pooler_output is not None
@@ -1413,6 +1417,7 @@ class Scheduler(SchedulerInterface):
                         finish_reason=finish_reason,
                         new_logprobs=new_logprobs,
                         new_prompt_logprobs_tensors=prompt_logprobs_tensors,
+                        activations=request_activations,
                         pooling_output=pooler_output,
                         stop_reason=request.stop_reason,
                         events=request.take_events(),
@@ -1677,26 +1682,18 @@ class Scheduler(SchedulerInterface):
                 request.record_event(EngineCoreEventType.QUEUED)
 
     def finish_requests(
-        self, request_ids: str | Iterable[str] | None, finished_status: RequestStatus
-    ) -> list[tuple[str, int]]:
+        self, request_ids: str | Iterable[str], finished_status: RequestStatus
+    ) -> None:
         """Handles the finish signal from outside the scheduler.
 
         For example, the API server can abort a request when the client
         disconnects.
-
-        If request_ids is None, all requests will be finished.
-
-        Returns:
-            Tuple of (req_id, client_index) for requests that were aborted. Will not
-            include any that were already finished.
         """
         assert RequestStatus.is_finished(finished_status)
         if isinstance(request_ids, str):
             request_ids = (request_ids,)
-        elif request_ids is not None:
-            request_ids = set(request_ids)
         else:
-            request_ids = self.requests.keys()
+            request_ids = set(request_ids)
 
         running_requests_to_remove = set()
         waiting_requests_to_remove = []
@@ -1736,8 +1733,6 @@ class Scheduler(SchedulerInterface):
             request.status = finished_status
             self._free_request(request, delay_free_blocks=delay_free_blocks)
 
-        return [(r.request_id, r.client_index) for r in valid_requests]
-
     def _free_request(
         self, request: Request, delay_free_blocks: bool = False
     ) -> dict[str, Any] | None:
@@ -1761,18 +1756,7 @@ class Scheduler(SchedulerInterface):
         self.kv_cache_manager.free(request)
         del self.requests[request.request_id]
 
-    @property
-    def pause_state(self) -> PauseState:
-        return self._pause_state
-
-    def set_pause_state(self, pause_state: PauseState) -> None:
-        self._pause_state = pause_state
-
     def get_num_unfinished_requests(self) -> int:
-        if self._pause_state == PauseState.PAUSED_ALL:
-            return 0
-        if self._pause_state == PauseState.PAUSED_NEW:
-            return len(self.running)
         num_waiting = len(self.waiting) - self.num_waiting_for_streaming_input
         return num_waiting + len(self.running)
 

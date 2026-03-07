@@ -33,11 +33,8 @@ from vllm.distributed.communication_op import tensor_model_parallel_all_gather
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.model_executor.layers.activation import ReLUSquaredActivation
 from vllm.model_executor.layers.attention import Attention
-from vllm.model_executor.layers.fused_moe import (
-    FusedMoE,
-    SharedFusedMoE,
-    activation_without_mul,
-)
+from vllm.model_executor.layers.fused_moe import FusedMoE, SharedFusedMoE
+from vllm.model_executor.layers.fused_moe.utils import activation_without_mul
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -601,6 +598,8 @@ class NemotronHModel(nn.Module):
 
         self.norm_f = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
 
+        self.aux_hidden_state_layers = tuple[int, ...]()
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
@@ -622,7 +621,12 @@ class NemotronHModel(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
+        aux_hidden_states = []
+        for idx, layer in enumerate(
+            islice(self.layers, self.start_layer, self.end_layer)
+        ):
+            if idx in self.aux_hidden_state_layers:
+                aux_hidden_states.append(hidden_states + residual)
             hidden_states, residual = layer(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -634,6 +638,8 @@ class NemotronHModel(nn.Module):
                 {"hidden_states": hidden_states, "residual": residual}
             )
         hidden_states, _ = self.norm_f(hidden_states, residual)
+        if len(aux_hidden_states) > 0:
+            return hidden_states, aux_hidden_states
         return hidden_states
 
     def _get_max_n_routed_experts(self) -> int:
@@ -920,6 +926,9 @@ class NemotronHForCausalLM(
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        self.model.aux_hidden_state_layers = layers
 
     def forward(
         self,

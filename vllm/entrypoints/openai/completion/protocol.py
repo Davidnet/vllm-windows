@@ -15,10 +15,12 @@ from vllm.config import ModelConfig
 from vllm.entrypoints.openai.engine.protocol import (
     AnyResponseFormat,
     LegacyStructuralTagResponseFormat,
+    LogitsProcessors,
     OpenAIBaseModel,
     StreamOptions,
     StructuralTagResponseFormat,
     UsageInfo,
+    get_logits_processors,
 )
 from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
@@ -115,6 +117,19 @@ class CompletionRequest(OpenAIBaseModel):
             "through out the inference process and return in response."
         ),
     )
+    logits_processors: LogitsProcessors | None = Field(
+        default=None,
+        description=(
+            "A list of either qualified names of logits processors, or "
+            "constructor objects, to apply when sampling. A constructor is "
+            "a JSON object with a required 'qualname' field specifying the "
+            "qualified name of the processor class/factory, and optional "
+            "'args' and 'kwargs' fields containing positional and keyword "
+            "arguments. For example: {'qualname': "
+            "'my_module.MyLogitsProcessor', 'args': [1, 2], 'kwargs': "
+            "{'param': 'value'}}."
+        ),
+    )
 
     return_tokens_as_token_ids: bool | None = Field(
         default=None,
@@ -157,6 +172,15 @@ class CompletionRequest(OpenAIBaseModel):
         description=(
             "Additional request parameters with string or "
             "numeric values, used by custom extensions."
+        ),
+    )
+
+    extract_activations: bool = Field(
+        default=False,
+        description=(
+            "Whether to extract hidden-state activations. "
+            "Layers are configured at startup via --extract-activation-layers. "
+            "If true, the response includes an activations field."
         ),
     )
 
@@ -206,6 +230,7 @@ class CompletionRequest(OpenAIBaseModel):
     def to_sampling_params(
         self,
         max_tokens: int,
+        logits_processor_pattern: str | None,
         default_sampling_params: dict | None = None,
     ) -> SamplingParams:
         if default_sampling_params is None:
@@ -276,7 +301,7 @@ class CompletionRequest(OpenAIBaseModel):
         if self.kv_transfer_params:
             # Pass in kv_transfer_params via extra_args
             extra_args["kv_transfer_params"] = self.kv_transfer_params
-        return SamplingParams.from_optional(
+        sampling_params = SamplingParams.from_optional(
             n=self.n,
             presence_penalty=self.presence_penalty,
             frequency_penalty=self.frequency_penalty,
@@ -296,6 +321,9 @@ class CompletionRequest(OpenAIBaseModel):
             skip_special_tokens=self.skip_special_tokens,
             spaces_between_special_tokens=self.spaces_between_special_tokens,
             include_stop_str_in_output=self.include_stop_str_in_output,
+            logits_processors=get_logits_processors(
+                self.logits_processors, logits_processor_pattern
+            ),
             truncate_prompt_tokens=self.truncate_prompt_tokens,
             output_kind=RequestOutputKind.DELTA
             if self.stream
@@ -306,6 +334,9 @@ class CompletionRequest(OpenAIBaseModel):
             extra_args=extra_args or None,
             skip_clone=True,  # Created fresh per request, safe to skip clone
         )
+        if self.extract_activations:
+            sampling_params.extract_activations = True
+        return sampling_params
 
     @model_validator(mode="before")
     @classmethod
@@ -415,6 +446,7 @@ class CompletionResponseChoice(OpenAIBaseModel):
     token_ids: list[int] | None = None  # For response
     prompt_logprobs: list[dict[int, Logprob] | None] | None = None
     prompt_token_ids: list[int] | None = None  # For prompt
+    activations: dict[str, list[float]] | None = None
 
 
 class CompletionResponse(OpenAIBaseModel):
