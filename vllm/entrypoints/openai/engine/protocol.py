@@ -4,10 +4,10 @@
 # Adapted from
 # https://github.com/lm-sys/FastChat/blob/168ccc29d3f7edc50823016105c024fe2282732a/fastchat/protocol/openai_api_protocol.py
 import time
-from http import HTTPStatus
 from typing import Any, ClassVar, Literal, TypeAlias
 
 import regex as re
+import torch
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -49,7 +49,7 @@ class OpenAIBaseModel(BaseModel):
 
         # Compare against both field names and aliases
         if any(k not in field_names for k in data):
-            logger.debug(
+            logger.warning(
                 "The following fields were present in the request but ignored: %s",
                 data.keys() - field_names,
             )
@@ -112,6 +112,17 @@ class UsageInfo(OpenAIBaseModel):
 class RequestResponseMetadata(BaseModel):
     request_id: str
     final_usage_info: UsageInfo | None = None
+
+
+def _serialize_activations(
+    activations: dict[int, torch.Tensor] | None,
+) -> dict[str, list[float]] | None:
+    if activations is None:
+        return None
+    return {
+        str(k): torch.nan_to_num(v.flatten(), nan=0.0).tolist()
+        for k, v in activations.items()
+    }
 
 
 class JsonSchemaResponseFormat(OpenAIBaseModel):
@@ -261,14 +272,6 @@ class DeltaMessage(OpenAIBaseModel):
     content: str | None = None
     reasoning: str | None = None
     tool_calls: list[DeltaToolCall] = Field(default_factory=list)
-
-
-class GenerationError(Exception):
-    """raised when finish_reason indicates internal server error (500)"""
-
-    def __init__(self, message: str = "Internal server error"):
-        super().__init__(message)
-        self.status_code = HTTPStatus.INTERNAL_SERVER_ERROR
 
 
 ####### Tokens IN <> Tokens OUT #######

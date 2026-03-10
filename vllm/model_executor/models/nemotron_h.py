@@ -33,11 +33,8 @@ from vllm.distributed.communication_op import tensor_model_parallel_all_gather
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.model_executor.layers.activation import ReLUSquaredActivation
 from vllm.model_executor.layers.attention import Attention
-from vllm.model_executor.layers.fused_moe import (
-    GateLinear,
-    SharedFusedMoE,
-    activation_without_mul,
-)
+from vllm.model_executor.layers.fused_moe import FusedMoE, SharedFusedMoE
+from vllm.model_executor.layers.fused_moe.utils import activation_without_mul
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -148,11 +145,13 @@ class NemotronHMoE(nn.Module):
 
         self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe
 
-        self.gate = GateLinear(
+        router_logits_dtype = torch.float32
+        self.gate = ReplicatedLinear(
             config.hidden_size,
             config.n_routed_experts,
-            out_dtype=torch.float32,
-            force_fp32_compute=True,
+            bias=False,
+            params_dtype=router_logits_dtype,
+            quant_config=None,
             prefix=f"{prefix}.gate",
         )
 
@@ -230,6 +229,7 @@ class NemotronHMoE(nn.Module):
             enable_eplb=self.enable_eplb,
             num_redundant_experts=self.n_redundant_experts,
             is_sequence_parallel=self.is_sequence_parallel,
+            router_logits_dtype=router_logits_dtype,
             routed_input_transform=self.fc1_latent_proj,
         )
 
@@ -241,7 +241,7 @@ class NemotronHMoE(nn.Module):
             hidden_states = sequence_parallel_chunk(hidden_states)
 
         # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states)
+        router_logits, _ = self.gate(hidden_states.to(dtype=torch.float32))
 
         # SharedFusedMoE handles:
         #   - shared experts (with original hidden_states)
@@ -295,11 +295,6 @@ class NemotronHMLPDecoderLayer(nn.Module):
 
         hybrid_override_pattern = config.hybrid_override_pattern
         mlp_index = hybrid_override_pattern[: layer_idx + 1].count("-") - 1
-        # Get per-layer config for heterogeneous models if exist
-        get_layer_config = getattr(config, "get_nemotron_h_config_for_layer", None)
-        layer_config = get_layer_config(layer_idx) if get_layer_config else config
-        config = layer_config
-
         if isinstance(config.intermediate_size, list):
             if len(config.intermediate_size) == 1:
                 intermediate_size = config.intermediate_size[0]
@@ -349,7 +344,7 @@ class NemotronHMoEDecoderLayer(nn.Module):
         super().__init__()
         self.config = config
 
-        # Get per-layer config for heterogeneous models if exists
+        # Get per-layer config for heterogeneous models if exsist
         get_layer_config = getattr(config, "get_nemotron_h_config_for_layer", None)
         layer_config = get_layer_config(layer_idx) if get_layer_config else config
 
@@ -517,7 +512,7 @@ class NemotronHAttentionDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
 
-        # Get per-layer config for heterogeneous models if exists
+        # Get per-layer config for heterogeneous models if exsist
         get_layer_config = getattr(config, "get_nemotron_h_config_for_layer", None)
         layer_config = get_layer_config(layer_idx) if get_layer_config else config
 
@@ -603,6 +598,8 @@ class NemotronHModel(nn.Module):
 
         self.norm_f = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
 
+        self.aux_hidden_state_layers = tuple[int, ...]()
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
@@ -624,7 +621,12 @@ class NemotronHModel(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
+        aux_hidden_states = []
+        for idx, layer in enumerate(
+            islice(self.layers, self.start_layer, self.end_layer)
+        ):
+            if idx in self.aux_hidden_state_layers:
+                aux_hidden_states.append(hidden_states + residual)
             hidden_states, residual = layer(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -636,10 +638,9 @@ class NemotronHModel(nn.Module):
                 {"hidden_states": hidden_states, "residual": residual}
             )
         hidden_states, _ = self.norm_f(hidden_states, residual)
+        if len(aux_hidden_states) > 0:
+            return hidden_states, aux_hidden_states
         return hidden_states
-
-    def is_spec_layer(self, config: NemotronHConfig, weight_name: str) -> bool:
-        return weight_name.startswith("mtp.")
 
     def _get_max_n_routed_experts(self) -> int:
         """Get max n_routed_experts from config or block_configs for puzzle models.
@@ -672,7 +673,7 @@ class NemotronHModel(nn.Module):
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         if self.has_moe:
             # (param_name, weight_name, expert_id, shard_id)
-            expert_params_mapping = SharedFusedMoE.make_expert_params_mapping(
+            expert_params_mapping = FusedMoE.make_expert_params_mapping(
                 # - FusedMoe.w1 (aka gate_proj) should be up_proj since that's
                 #   what the activation is applied to
                 # - FusedMoe.w3 (aka up_proj) should be ignored since we're
@@ -706,10 +707,6 @@ class NemotronHModel(nn.Module):
                 name = maybe_remap_kv_scale_name(name, params_dict)
                 if name is None:
                     continue
-
-            # Skip MTP/spec decode layers early (before stacked params mapping)
-            if name.startswith("mtp."):
-                continue
 
             # load stacked params
             for param_name, weight_name, shard_id in stacked_params_mapping:
@@ -854,7 +851,6 @@ class NemotronHForCausalLM(
             head_dim=hf_config.mamba_head_dim,
             state_size=hf_config.ssm_state_size,
             conv_kernel=hf_config.conv_kernel,
-            num_spec=vllm_config.num_speculative_tokens,
         )
 
     @classmethod
@@ -930,6 +926,9 @@ class NemotronHForCausalLM(
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        self.model.aux_hidden_state_layers = layers
 
     def forward(
         self,
